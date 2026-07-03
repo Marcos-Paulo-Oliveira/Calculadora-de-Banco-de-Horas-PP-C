@@ -1,12 +1,10 @@
 import streamlit as st
-import anthropic
-import json
-import base64
+import re
+from pypdf import PdfReader
 
 # Configuração da página
 st.set_page_config(page_title="Calculadora de Banco de Horas - PP&C", page_icon="💰", layout="centered")
 
-# Estilização personalizada para ficar parecido com o layout moderno
 st.markdown("""
     <style>
     .main { background-color: #f8f9fa; }
@@ -19,7 +17,6 @@ st.markdown("""
 st.markdown("<h1 class='title'>💰 Calculadora de Banco de Horas</h1>", unsafe_allow_html=True)
 st.markdown("<p class='subtitle'>PP&C SERVIÇOS DE BPO LTDA</p>", unsafe_allow_html=True)
 
-# Caixa de informações da empresa
 st.markdown("""
 <div class='info-box'>
     <strong>Período Quadrimestral:</strong> 01/04/2026 a 31/07/2026<br>
@@ -27,107 +24,96 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Inputs do usuário
+# Inputs
 gross_salary = st.number_input("Salário Bruto Mensal (R$)", min_value=0.0, step=0.01, help="Informe seu salário base sem descontos.")
 uploaded_file = st.file_uploader("Upload do Espelho de Ponto (PDF)", type=["pdf"])
 
+def convert_hhmm_to_decimal(time_str):
+    """Converte strings no formato HH:MM ou H:MM para decimal (ex: 02:30 -> 2.5)"""
+    if not time_str or time_str.strip() == "":
+        return 0.0
+    try:
+        parts = time_str.split(':')
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        return hours + (minutes / 60.0)
+    except:
+        return 0.0
+
+def extrair_dados_pdf(file):
+    """Lê o texto do PDF e busca os valores de horas usando expressões regulares"""
+    reader = PdfReader(file)
+    full_text = ""
+    for page in reader.pages:
+        full_text += page.extract_text() + "\n"
+    
+    # Dicionário padrão de retorno
+    dados = {"hours_60": 0.0, "hours_80": 0.0, "hours_100": 0.0, "period": "Não identificado"}
+    
+    # Tenta capturar o período/mês de referência do espelho
+    match_periodo = re.search(r"Período:\s*(\d{2}/\d{2}/\d{4})\s*a\s*(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
+    if match_periodo:
+        dados["period"] = f"{match_periodo.group(1)} a {match_periodo.group(2)}"
+    
+    # Procura pelos padrões clássicos de banco de horas no texto
+    # Captura formatos como "H. Extra 60% 02:30" ou variações comuns
+    match_60 = re.search(r"(?:Extra|H\.E\.|H\.\s*Extra)\s*60%\s*.*?(\d{1,2}:\d{2})", full_text, re.IGNORECASE)
+    match_80 = re.search(r"(?:Extra|H\.E\.|H\.\s*Extra)\s*80%\s*.*?(\d{1,2}:\d{2})", full_text, re.IGNORECASE)
+    match_100 = re.search(r"(?:Extra|H\.E\.|H\.\s*Extra|Feriado)\s*100%\s*.*?(\d{1,2}:\d{2})", full_text, re.IGNORECASE)
+    
+    if match_60:
+        dados["hours_60"] = convert_hhmm_to_decimal(match_60.group(1))
+    if match_80:
+        dados["hours_80"] = convert_hhmm_to_decimal(match_80.group(1))
+    if match_100:
+        dados["hours_100"] = convert_hhmm_to_decimal(match_100.group(1))
+        
+    return dados
+
 if gross_salary > 0 and uploaded_file is not None:
     if st.button("🚀 Calcular Banco de Horas", use_container_width=True):
-        with st.spinner("Analisando o espelho de ponto com IA..."):
+        with st.spinner("Processando o arquivo PDF localmente de forma gratuita..."):
             try:
-                # 1. Puxa a chave de forma segura das configurações do Streamlit
-                if "ANTHROPIC_API_KEY" not in st.secrets:
-                    st.error("Chave API da Anthropic não configurada nos Secrets do Streamlit.")
-                    st.stop()
+                # Extração local via código puro
+                result = extrair_dados_pdf(uploaded_file)
                 
-                client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-                
-                # 2. Converte o PDF enviado para Base64
-                file_bytes = uploaded_file.read()
-                base64_pdf = base64.b64encode(file_bytes).decode("utf-8")
-                
-                # 3. Prompt para extração dos dados
-                prompt = """Analise este espelho de ponto e extraia APENAS os valores de horas do banco de horas em JSON.
-                Procure pela seção "Banco de horas: mensal" e extraia:
-                - H. Extra 60% (horas com acréscimo de 60%)
-                - H.E. Extra 80% (horas com acréscimo de 80%)
-                - H.E. Extraordin 100% ou horas em sábado/domingo/feriado (acréscimo de 100%)
-
-                IMPORTANTE: Converta o formato HH:MM para decimal (exemplo: 2:30 = 2.5 horas)
-
-                Responda APENAS com JSON neste formato, sem textos antes ou depois:
-                {
-                  "hours_60": número_decimal,
-                  "hours_80": número_decimal,
-                  "hours_100": número_decimal,
-                  "period": "descrição do período (exemplo: 'Maio/2026')"
-                }"""
-                
-                # 4. Chamada da API usando o modelo correto
-                message = client.messages.create(
-                    model="claude-3-5-sonnet-latest",
-                    max_tokens=1000,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "document",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "application/pdf",
-                                        "data": base64_pdf
-                                    }
-                                },
-                                {
-                                    "type": "text",
-                                    "text": prompt
-                                }
-                            ]
-                        }
-                    ]
-                )
-                
-                # 5. Processando a resposta da IA
-                response_text = message.content[0].text.strip()
-                result = json.loads(response_text)
-                
-                # 6. Cálculos de negócio (Regras PP&C)
+                # Regras de negócio
                 hourly_rate = gross_salary / 176
                 
-                hours60 = float(result.get("hours_60", 0))
-                hours80 = float(result.get("hours_80", 0))
-                hours100 = float(result.get("hours_100", 0))
-                period = result.get("period", "Não identificado")
+                hours60 = result["hours_60"]
+                hours80 = result["hours_80"]
+                hours100 = result["hours_100"]
+                period = result["period"]
                 
-                # Ajuste de limite de 2h para 60%
+                # Aplica a regra de transbordo da PP&C (máximo de 2 horas a 60%)
                 if hours60 > 2:
                     excess = hours60 - 2
                     hours80 += excess
                     hours60 = 2
-                    
+                
                 val_60 = hours60 * hourly_rate * 1.60
                 val_80 = hours80 * hourly_rate * 1.80
                 val_100 = hours100 * hourly_rate * 2.00
                 total_geral = val_60 + val_80 + val_100
                 
-                # 7. Exibição dos Resultados na Tela
-                st.success("✅ Cálculo realizado com sucesso!")
-                st.subheader(f"Resumo do Cálculo - Período: {period}")
+                # Exibição
+                st.success("✅ Cálculo efetuado com sucesso!")
+                st.subheader(f"Resumo do Cálculo")
+                st.caption(f"Período do Ponto: {period}")
                 st.metric(label="Valor Total Estimado a Receber", value=f"R$ {total_geral:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
                 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("Horas 60%", f"{hours60}h", f"R$ {val_60:.2f}")
+                    st.metric("Horas 60%", f"{hours60:.2f}h", f"R$ {val_60:.2f}")
                 with col2:
-                    st.metric("Horas 80%", f"{hours80}h", f"R$ {val_80:.2f}")
+                    st.metric("Horas 80%", f"{hours80:.2f}h", f"R$ {val_80:.2f}")
                 with col3:
-                    st.metric("Horas 100%", f"{hours100}h", f"R$ {val_100:.2f}")
+                    st.metric("Horas 100%", f"{hours100:.2f}h", f"R$ {val_100:.2f}")
                     
-                st.info(f"💡 Valor da sua hora base calculada: R$ {hourly_rate:.2f}")
+                st.info(f"💡 Base de Cálculo: Valor da hora normal = R$ {hourly_rate:.2f}")
                 
             except Exception as e:
-                st.error(f"Erro ao processar o documento: {e}")
+                st.error(f"Erro ao processar o layout do PDF: {e}. Certifique-se de que é um PDF contendo texto legível.")
 
 st.markdown("""
 <hr><p style='text-align: center; font-size: 11px; color: #999;'>
